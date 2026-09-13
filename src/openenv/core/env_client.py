@@ -241,11 +241,17 @@ async def _best_effort_close(ws: ClientConnection) -> None:
 
     Scheduled as a background task (never awaited directly) so a dropped
     socket's close handshake can't hold up the caller that triggered the
-    drop -- see `EnvClient._receive()`.
+    drop -- see `EnvClient._receive()`. `EnvClient._close_async()` awaits
+    any still-running instance of this task before it returns, so a real
+    `close()` call does wait for the handshake; only the caller that
+    happened to trigger the drop is spared. `CancelledError` is caught
+    alongside `Exception` because that awaiting is exactly what would
+    otherwise cancel this mid-handshake if a caller called `close()`
+    concurrently.
     """
     try:
         await ws.close()
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         pass  # Best effort
 
 
@@ -955,6 +961,13 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
             with suppress(Exception):
                 await child.close()
         self._child_clients.clear()
+
+        # Wait out any backgrounded closes from a dropped socket (see
+        # `_receive()` / `_best_effort_close`) so a real close() call still
+        # sees the handshake through instead of the sync wrapper's
+        # `_stop_loop()` cancelling it mid-flight once the loop stops.
+        if self._pending_close_tasks:
+            await asyncio.gather(*self._pending_close_tasks, return_exceptions=True)
 
         try:
             await self._disconnect_async()

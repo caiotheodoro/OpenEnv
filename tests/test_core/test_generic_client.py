@@ -1551,6 +1551,53 @@ class TestForeignLoopReconnect:
         await asyncio.sleep(2.1)
         assert original_ws.state == State.CLOSED
 
+    @pytest.mark.asyncio
+    async def test_close_waits_for_pending_background_close(self):
+        """`close()` must not return until a backgrounded socket close (the
+        fire-and-forget cleanup in `_receive()`) has actually finished.
+
+        Regression for a second Bugbot finding on #1149:
+        `_pending_close_tasks` was never awaited anywhere, so
+        `SyncEnvClient.close()` could call `_stop_loop()` and tear down the
+        event loop while a background close was still mid-handshake,
+        abandoning it -- the server-side session could stay allocated.
+        """
+        close_completed = False
+
+        class SlowBackgroundClose:
+            state = State.OPEN
+
+            async def send(self, _message):
+                pass
+
+            async def recv(self):
+                await asyncio.sleep(10)
+
+            async def close(self):
+                nonlocal close_completed
+                await asyncio.sleep(0.05)
+                close_completed = True
+                self.state = State.CLOSED
+
+        client = GenericEnvClient(
+            base_url="http://localhost:8000", message_timeout_s=0.01
+        )
+        dropped_ws = SlowBackgroundClose()
+        client._ws = dropped_ws
+        client._ws_loop = asyncio.get_running_loop()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await client._send_and_receive({"type": "state"})
+
+        assert client._pending_close_tasks  # background close was scheduled
+        assert not close_completed  # ...but hasn't run yet
+
+        await client._close_async()
+
+        assert close_completed, (
+            "close() returned before the backgrounded socket close finished"
+        )
+
 
 # ============================================================================
 # Integration Tests (require running server)
