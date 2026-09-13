@@ -1413,6 +1413,11 @@ class TestForeignLoopReconnect:
             await client._send_and_receive({"type": "state"})
 
         assert client._ws is None
+        # The socket drop no longer awaits close() inline (a slow close
+        # handshake would otherwise stall the caller's own deadline -- see
+        # test_receive_cancelled_by_outer_deadline_...); it's scheduled as
+        # a background task instead. Give the loop one tick to run it.
+        await asyncio.sleep(0)
         assert original_ws.state == State.CLOSED
 
         replacement_ws = AsyncMock()
@@ -1470,6 +1475,8 @@ class TestForeignLoopReconnect:
             )
 
         assert client._ws is None
+        # Background close task, same as above -- give the loop one tick.
+        await asyncio.sleep(0)
         assert original_ws.state == State.CLOSED
 
         replacement_ws = AsyncMock()
@@ -1486,6 +1493,63 @@ class TestForeignLoopReconnect:
 
         mock_connect.assert_called_once()
         assert client._ws is replacement_ws
+
+    @pytest.mark.asyncio
+    async def test_slow_close_handshake_does_not_stall_callers_deadline(self):
+        """A slow close handshake on the dropped socket must not eat into
+        the caller's own deadline.
+
+        Regression for the Bugbot finding on #1149: `_receive()` used to
+        `await ws.close()` inline before re-raising, so an outer
+        `asyncio.wait_for(..., timeout=50ms)` didn't actually return in
+        50ms if the server was slow to ack the close (websockets' default
+        `close_timeout` is 10s) -- the caller was blocked on a handshake it
+        never asked to wait on. The close is now fire-and-forget.
+        """
+
+        close_started = asyncio.Event()
+
+        class NeverRespondsSlowClose:
+            state = State.OPEN
+
+            async def send(self, _message):
+                pass
+
+            async def recv(self):
+                await asyncio.sleep(10)
+
+            async def close(self):
+                close_started.set()
+                await asyncio.sleep(2)  # simulate a stalled close handshake
+                self.state = State.CLOSED
+
+        client = GenericEnvClient(
+            base_url="http://localhost:8000", message_timeout_s=10
+        )
+        original_ws = NeverRespondsSlowClose()
+        client._ws = original_ws
+        client._ws_loop = asyncio.get_running_loop()
+
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                client._send_and_receive({"type": "state"}), timeout=0.05
+            )
+        elapsed = loop.time() - start
+
+        # The 2s close handshake must not have been awaited inline: the
+        # caller's own 50ms deadline should be honored, not the socket's.
+        assert elapsed < 1.0, (
+            f"caller's 50ms deadline took {elapsed:.2f}s -- the close "
+            "handshake was awaited inline instead of backgrounded"
+        )
+        assert client._ws is None
+
+        # The close still actually happens, just not on the caller's time.
+        await close_started.wait()
+        await asyncio.sleep(2.1)
+        assert original_ws.state == State.CLOSED
 
 
 # ============================================================================

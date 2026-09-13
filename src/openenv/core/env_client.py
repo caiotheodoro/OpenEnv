@@ -236,6 +236,19 @@ def _required_start_container_parameters(provider: Any) -> list[str]:
     ]
 
 
+async def _best_effort_close(ws: ClientConnection) -> None:
+    """Close a socket without letting a slow handshake or failure propagate.
+
+    Scheduled as a background task (never awaited directly) so a dropped
+    socket's close handshake can't hold up the caller that triggered the
+    drop -- see `EnvClient._receive()`.
+    """
+    try:
+        await ws.close()
+    except Exception:
+        pass  # Best effort
+
+
 class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
     """
     Async environment client for persistent sessions.
@@ -337,6 +350,9 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
         self._execution_mode: Optional[str] = None
         self._sync_client: Optional["SyncEnvClient[ActT, ObsT, StateT]"] = None
         self._ws_loop: Optional[asyncio.AbstractEventLoop] = None
+        # Strong references for fire-and-forget socket closes (see _receive),
+        # so the task isn't garbage-collected mid-close. Discarded on done.
+        self._pending_close_tasks: set[asyncio.Task] = set()
         if base_url is not None:
             self._set_base_url(base_url)
 
@@ -612,10 +628,16 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
             ws = self._ws
             self._ws = None
             self._ws_loop = None
-            try:
-                await ws.close()
-            except Exception:
-                pass  # Best effort
+            # Fire-and-forget: `close()` waits out the library's close
+            # handshake (`close_timeout`, 10s by default) if the server is
+            # slow to ack, and *awaiting* that here would hold up this
+            # exception -- so an outer `asyncio.wait_for(..., timeout=50ms)`
+            # would actually block for up to 10s before its deadline was
+            # honored. Scheduling it lets the exception propagate
+            # immediately while the close still happens in the background.
+            close_task = asyncio.ensure_future(_best_effort_close(ws))
+            self._pending_close_tasks.add(close_task)
+            close_task.add_done_callback(self._pending_close_tasks.discard)
             raise
         return json.loads(raw)
 
